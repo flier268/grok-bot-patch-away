@@ -1,14 +1,17 @@
 #!/usr/bin/env python3
-"""Stop Grok Bot from parking this computer after the window stays unfocused.
+"""Stop Grok Bot from parking this computer as away.
 
 Grok Bot treats the desktop as away when the session suspends, the screen
-locks, or its window stays unfocused for about 10 minutes. This rewrites the
-unfocused check inside app.asar so that branch is never true. Suspend and
-screen lock are left unchanged.
+locks, or its window stays unfocused for about 10 minutes. This rewrites that
+check inside app.asar so it is never true. The cloud computer is not parked
+for those reasons, and waking from sleep does not have to clear a stuck away
+state because suspend never enters it.
 
 The match uses the stable property names isSuspended, isScreenLocked, and
 unfocusedSinceMs, then updates that file's asar integrity hash. Minified
-function names and byte offsets can change between versions.
+function names and byte offsets can change between versions. A file patched by
+an older copy of this script, which only disabled the unfocused check, is
+upgraded.
 
 Usage:
   grok-bot-patch-away.py                 # patch the local install
@@ -33,20 +36,16 @@ import sys
 import tempfile
 from pathlib import Path
 
-# Same length, always false: a timestamp or null is never Infinity.
-REPLACEMENTS = (
-    # Each pair is the same length. 1/0 is Infinity, so the comparison is never true.
-    (b"!==null", b"===1/0 "),
-    (b"!=null", b"===1/0"),
-    (b"!==void 0", b"===1/0&&0"),
+# The whole return expression, including an older patch that only rewrote the
+# unfocused null test. Replaced with `return!1;/*...*/` of the same length.
+AWAY_RETURN = re.compile(
+    rb"return [A-Za-z_$][\w$]*\.isSuspended\|\|"
+    rb"[A-Za-z_$][\w$]*\.isScreenLocked\|\|"
+    rb"[A-Za-z_$][\w$]*\.unfocusedSinceMs"
+    rb"(?:!==null|!=null|!==void 0|===1/0 |===1/0&&0)"
+    rb"[^}]{0,180}(?=\})"
 )
-if any(len(old) != len(new) for old, new in REPLACEMENTS):
-    raise RuntimeError("replacement lengths drifted")
-
-AWAY_CHECK = re.compile(
-    rb"isSuspended\|\|[A-Za-z_$][\w$]*\.isScreenLocked\|\|"
-    rb"[A-Za-z_$][\w$]*\.unfocusedSinceMs(?:!==null|!=null|!==void 0)"
-)
+ALREADY_PATCHED = b"return!1;/*"
 
 
 def candidate_asars() -> list[Path]:
@@ -105,32 +104,30 @@ def file_bytes(data: bytes, data_start: int, asar_path: Path, rel: str, info: di
     return data[start : start + int(size)]
 
 
+def neutralize_return(expr: bytes) -> bytes:
+    prefix = b"return!1;/*"
+    suffix = b"*/"
+    pad = len(expr) - len(prefix) - len(suffix)
+    if pad < 0:
+        raise SystemExit("away check is shorter than the replacement")
+    return prefix + (b"*" * pad) + suffix
+
+
 def patch_bytes(blob: bytes) -> bytes | None:
     """Return patched bytes, or None when this blob has no away check."""
-    matches = list(AWAY_CHECK.finditer(blob))
+    matches = list(AWAY_RETURN.finditer(blob))
     if not matches:
-        if b"unfocusedSinceMs===1/0" in blob or b"unfocusedSinceMs===1/0&&0" in blob:
+        if ALREADY_PATCHED in blob:
             return blob
         return None
     out = bytearray(blob)
-    for match in matches:
+    for match in reversed(matches):
         start, end = match.span()
-        piece = out[start:end]
-        replaced = False
-        for old, new in REPLACEMENTS:
-            if len(old) != len(new):
-                raise SystemExit(f"internal error: {old!r} and {new!r} differ in length")
-            index = piece.rfind(old)
-            if index == -1:
-                continue
-            piece = piece[:index] + new + piece[index + len(old) :]
-            replaced = True
-            break
-        if not replaced:
-            text = piece.decode("utf-8", "replace")
-            raise SystemExit(f"recognized the away check but not its null test: {text}")
-        out[start:end] = piece
-    return bytes(out)
+        out[start:end] = neutralize_return(bytes(out[start:end]))
+    patched = bytes(out)
+    if AWAY_RETURN.search(patched):
+        raise SystemExit("away check was still present after patching")
+    return patched
 
 
 def integrity_hashes(blob: bytes, block_size: int) -> tuple[str, list[str]]:
